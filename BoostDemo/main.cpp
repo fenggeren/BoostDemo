@@ -1,7 +1,6 @@
 
 #include <boost/beast.hpp>
-#include <boost/asio/connect.hpp>
-#include <boost/asio/ip/tcp.hpp>
+#include <boost/asio.hpp>
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -106,6 +105,101 @@ int main_websocket(int argc, char** argv)
     return EXIT_SUCCESS;
 }
 
+template<class AsyncStream, class CompletionToken>
+BOOST_ASIO_INITFN_RESULT_TYPE(CompletionToken, void(boost::beast::error_code))
+async_echo(AsyncStream& stream, CompletionToken&& token);
+
+template<class AsyncStream, class Handler>
+class echo_op;
+
+template <class AsyncStream, class CompletionToken>
+BOOST_ASIO_INITFN_RESULT_TYPE(CompletionToken, void(boost::beast::error_code))
+async_echo(AsyncStream& stream, CompletionToken&& token)
+{
+    static_assert(boost::beast::is_async_stream<AsyncStream>::value, "AsyncStream requirements not met");
+    boost::asio::async_completion<CompletionToken, void(boost::beast::error_code)> init{token};
+    
+    echo_op<AsyncStream, BOOST_ASIO_HANDLER_TYPE(CompletionToken, void(boost::beast::error_code))>
+    {stream, init.completion_handler}
+    (boost::beast::error_code{}, 0);
+    
+    return init.result.get();
+}
+
+template<class AsyncStream, class Handler>
+class echo_op
+{
+    struct state
+    {
+        AsyncStream& stream;
+        int step = 0;
+        
+        boost::asio::basic_streambuf<typename std::allocator_traits<
+        boost::asio::associated_allocator_t<Handler>>:: template rebind_alloc<char>> buffer;
+        
+        explicit state(Handler& handler, AsyncStream& stream_)
+        :stream(stream_),
+        buffer((std::numeric_limits<std::size_t>::max)(),
+               boost::asio::get_associated_allocator(handler))
+        {
+            
+        }
+    };
+    
+    boost::beast::handler_ptr<state, Handler> p_;
+    
+public:
+    
+    echo_op(echo_op&&) = default;
+    echo_op(echo_op const&) = default;
+    
+    template<class DeducedHandler, class... Args>
+    echo_op(AsyncStream& stream, DeducedHandler&& handler)
+    :p_(std::forward<DeducedHandler>(handler), stream)
+    {
+        
+    }
+    
+    using allocator_type = boost::asio::associated_allocator_t<Handler>;
+    
+    allocator_type get_allocator() const noexcept
+    {
+        return boost::asio::get_associated_allocator(p_.handler());
+    }
+    
+    using executor_type = boost::asio::associated_executor_t<
+    Handler, decltype(std::declval<AsyncStream&>().get_executor())>;
+    
+    executor_type get_executor() const noexcept
+    {
+        return boost::asio::get_associated_executor(p_.handler(), p_.stream.get_executor());
+    }
+    
+    void operator()(boost::beast::error_code ec, std::size_t bytes_transferred);
+};
+
+template<class AsyncStream, class Handler>
+void echo_op<AsyncStream, Handler>::
+operator()(boost::beast::error_code ec, std::size_t bytes_transferred)
+{
+    auto& p = *p_;
+    
+    switch (ec ? 2 : p.step)
+    {
+        case 0:
+            p.step = 1;
+            return boost::asio::async_read_until(p.stream, p.buffer, "\r", std::move(*this));
+        case 1:
+            p.step = 2;
+            return boost::asio::async_write(p.stream, boost::beast::buffers_prefix(bytes_transferred, p.buffer.data()), std::move(*this));
+        case 2:
+            p.buffer.consume(bytes_transferred);
+            break;
+    }
+    
+    p_.invoke(ec);
+    return;
+}
 
 int main(int argv, char **argc)
 {
